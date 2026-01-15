@@ -4,3 +4,6 @@ __pycache__/
 venv/
 *.egg-info/
 .DS_Store
+*.db
+.vscode/
+.idea/
