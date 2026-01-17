@@ -2,5 +2,6 @@ Flask==3.0.0
 Flask-CORS==4.0.0
 Pillow==11.0.0
 numpy==1.26.4
-opencv-python==4.10.0.84
+opencv-python-headless==4.10.0.84
+scikit-learn==1.4.0
 gunicorn==23.0.0
