@@ -11,4 +11,4 @@ jobs:
     steps:
       - name: Ping Render health endpoint
         run: |
-          curl -s https://skin-tone-detector-h1ii.onrender.com/health
+          curl -fsS https://skin-tone-detector-h1ii.onrender.com/health || echo "Health check failed"
