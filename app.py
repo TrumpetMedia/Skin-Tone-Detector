@@ -1,11 +1,25 @@
 import base64
 import numpy as np
 import cv2
+import logging
 from io import BytesIO
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
-from sklearn.cluster import KMeans
+
+# ---------------- CONFIG ---------------- #
+
+MAX_IMAGE_SIZE = 800
+MIN_SKIN_PIXELS = 120
+
+# Logging (prints to Render / console)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger(__name__)
+
+# ---------------- APP ---------------- #
 
 app = Flask(__name__)
 CORS(app)
@@ -14,153 +28,156 @@ face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
 
+# ---------------- UTILITIES ---------------- #
 
-def white_patch_retinex(img):
-    """Color constancy: neutralize dominant light cast."""
-    img_float = img.astype(float)
-    b, g, r = cv2.split(img_float)
-
-    def get_max_val(channel):
-        flat = np.sort(channel.flatten())[::-1]
-        top_count = max(1, int(len(flat) * 0.01))
-        return np.mean(flat[:top_count])
-
-    b_max = max(1, get_max_val(b))
-    g_max = max(1, get_max_val(g))
-    r_max = max(1, get_max_val(r))
-
-    b = np.minimum(b * (255.0 / b_max), 255)
-    g = np.minimum(g * (255.0 / g_max), 255)
-    r = np.minimum(r * (255.0 / r_max), 255)
-
-    return cv2.merge([b, g, r]).astype(np.uint8)
-
-
-def get_true_skin_tone_from_bgr(img_bgr):
+def white_patch_retinex_safe(img):
     """
-    Extract skin tone features from an already-loaded BGR image.
-    Returns: (debug_info, chroma, hue_bias, face_base64)
+    Safer color constancy:
+    uses top 0.5% instead of 1% to avoid highlight blowout.
     """
-    if img_bgr is None:
-        return None, None, None, None
+    img = img.astype(np.float32)
+    out = np.zeros_like(img)
 
-    # 1) Face detection
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    for i in range(3):
+        channel = img[:, :, i]
+        top = np.percentile(channel, 99.5)
+        scale = 255.0 / max(top, 1)
+        out[:, :, i] = np.clip(channel * scale, 0, 255)
+
+    return out.astype(np.uint8)
+
+
+def extract_face_roi(img):
+    """
+    Detect face; fallback to center crop.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     faces = face_cascade.detectMultiScale(gray, 1.2, 5)
 
     if len(faces) == 0:
-        h, w = img_bgr.shape[:2]
-        roi = img_bgr[int(h * 0.2): int(h * 0.8), int(w * 0.2): int(w * 0.8)]
-    else:
-        (x, y, w, h) = max(faces, key=lambda f: f[2] * f[3])
-        roi = img_bgr[
-            y + int(h * 0.15): y + int(h * 0.85),
-            x + int(w * 0.15): x + int(w * 0.85)
-        ]
+        h, w = img.shape[:2]
+        log.info("Face not detected, using center fallback")
+        return img[int(h * 0.25):int(h * 0.75),
+                   int(w * 0.25):int(w * 0.75)]
 
-    # 2) Color correction
-    corrected_roi = white_patch_retinex(roi)
+    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+    # log.info(f"Face detected: x={x}, y={y}, w={w}, h={h}")
 
-    # Encode face crop for frontend preview/debug (not saved to disk)
-    ok, buffer = cv2.imencode(".jpg", corrected_roi)
-    face_base64 = base64.b64encode(buffer).decode("utf-8") if ok else None
+    return img[y:y + h, x:x + w]
 
-    # 3) Skin masking (YCbCr)
-    ycrcb_roi = cv2.cvtColor(corrected_roi, cv2.COLOR_BGR2YCrCb)
-    min_ycrcb = np.array([80, 135, 85], np.uint8)
-    max_ycrcb = np.array([255, 170, 115], np.uint8)
 
-    mask = cv2.inRange(ycrcb_roi, min_ycrcb, max_ycrcb)
-    mask = cv2.GaussianBlur(mask, (5, 5), 0)
-    _, mask = cv2.threshold(mask, 128, 255, cv2.THRESH_BINARY)
+def extract_cheeks(face):
+    """
+    Sample left & right cheek regions only.
+    This dramatically improves tone stability.
+    """
+    h, w = face.shape[:2]
 
-    skin_extracted = cv2.bitwise_and(corrected_roi, corrected_roi, mask=mask)
-    pixels_bgr = skin_extracted[mask == 255]
+    left = face[int(h * 0.45):int(h * 0.65),
+                int(w * 0.15):int(w * 0.35)]
 
-    if pixels_bgr.shape[0] < 50:
-        return None, None, None, face_base64
+    right = face[int(h * 0.45):int(h * 0.65),
+                 int(w * 0.65):int(w * 0.85)]
 
-    # 4) K-means (kept for consistency; not used directly)
-    kmeans = KMeans(n_clusters=3, n_init=10, random_state=42)
-    kmeans.fit(pixels_bgr)
+    return cv2.vconcat([left, right])
 
-    # Distribution stats in YCbCr
-    all_ycrcb = cv2.cvtColor(skin_extracted, cv2.COLOR_BGR2YCrCb)
-    skin_y = all_ycrcb[mask == 255, 0]
-    skin_cb = all_ycrcb[mask == 255, 1]
-    skin_cr = all_ycrcb[mask == 255, 2]
 
-    y_mean = float(np.mean(skin_y))
-    y_p50 = float(np.percentile(skin_y, 50))
-    y_p75 = float(np.percentile(skin_y, 75))
+def skin_mask_combined(bgr):
+    """
+    Combined HSV + YCrCb skin masking.
+    Much more robust across ethnicities.
+    """
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
 
-    cb_mean = float(np.mean(skin_cb))
-    cr_mean = float(np.mean(skin_cr))
+    hsv_mask = cv2.inRange(
+        hsv,
+        np.array([0, 30, 60]),
+        np.array([25, 200, 255])
+    )
 
-    chroma = float(np.sqrt((cb_mean - 128) ** 2 + (cr_mean - 128) ** 2))
-    hue_bias = float(cr_mean / (cb_mean + 1e-6))
+    ycrcb_mask = cv2.inRange(
+        ycrcb,
+        np.array([0, 133, 77]),
+        np.array([255, 173, 127])
+    )
 
-    debug_info = {
-        "y_mean": y_mean,
-        "y_p50": y_p50,
-        "y_p75": y_p75,
-        "cb_mean": cb_mean,
-        "cr_mean": cr_mean,
-        "chroma": chroma,
-        "hue_bias": hue_bias,
+    mask = cv2.bitwise_and(hsv_mask, ycrcb_mask)
+    mask = cv2.medianBlur(mask, 5)
+
+    return mask
+
+
+# ---------------- CORE LOGIC ---------------- #
+
+def analyze_skin_tone(img_bgr):
+    """
+    Returns:
+    tone, debug_info, face_crop_base64
+    """
+
+    face = extract_face_roi(img_bgr)
+    face = white_patch_retinex_safe(face)
+    cheeks = extract_cheeks(face)
+
+    # Encode face preview
+    ok, buf = cv2.imencode(".jpg", face)
+    face_b64 = base64.b64encode(buf).decode() if ok else None
+
+    mask = skin_mask_combined(cheeks)
+    skin_pixels = cheeks[mask > 0]
+
+    if skin_pixels.shape[0] < MIN_SKIN_PIXELS:
+        log.warning("Not enough skin pixels detected")
+        return None, None, face_b64
+
+    ycrcb = cv2.cvtColor(skin_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2YCrCb)
+    y = ycrcb[:, 0, 0]
+    cb = ycrcb[:, 0, 1]
+    cr = ycrcb[:, 0, 2]
+
+    # Robust luminance estimation
+    y_sorted = np.sort(y)
+    base_y = float(np.median(y_sorted[:int(len(y_sorted) * 0.35)]))
+
+    chroma = float(np.sqrt(
+        (np.mean(cb) - 128) ** 2 +
+        (np.mean(cr) - 128) ** 2
+    ))
+    y_p75 = float(np.percentile(y, 75))
+    rsbi = base_y / max(y_p75, 1)
+    debug = {
+        "skin_pixels": int(len(y)),
+        "base_y": round(base_y, 2),
+        "y_p75": round(y_p75, 2),
+        "rsbi": round(rsbi, 3),
+        "chroma": round(chroma, 2),
+        "y_mean": round(float(np.mean(y)), 2),
+        "cb_mean": round(float(np.mean(cb)), 2),
+        "cr_mean": round(float(np.mean(cr)), 2)
     }
 
-    return debug_info, chroma, hue_bias, face_base64
+    # log.info(
+    #     f"METRICS | base_y={debug['base_y']} | "
+    #     f"y_p75={debug['y_p75']} | "
+    #     f"rsbi={debug['rsbi']} | "
+    #     f"chroma={debug['chroma']}"
+    # )
 
-
-def classify_tone_v2_improved(y_mean, y_p75, chroma, hue_bias):
-    # Warm-light detection
-    warm_light_suspected = (hue_bias < 0.8) and (130 < y_mean < 165)
-
-    score = 0.0
-
-    # Luminance
-    if y_mean >= 170:
-        score += 3.0
-    elif y_mean >= 160:
-        score += 2.0
-    elif y_mean >= 150:
-        score += 1.0
-    elif y_mean >= 140:
-        score -= 0.5
+    # Classification (non-ML)
+    if rsbi > 0.82:
+        tone = "light"
+    elif rsbi < 0.68:
+        tone = "deep"
     else:
-        score -= 2.0
+        tone = "medium"
 
-    # Chroma
-    if chroma > 38:
-        score -= 2.0
-    elif chroma > 30:
-        score -= 1.5
-    elif chroma > 25:
-        score -= 0.5
-    elif chroma < 18:
-        score += 2.5
-    elif chroma < 22:
-        score += 1.5
+    # log.info(f"CLASSIFIED TONE: {tone}")
 
-    # Hue bias (downweighted if warm light suspected)
-    hue_weight = 0.5 if warm_light_suspected else 1.0
+    return tone, debug, face_b64
 
-    if hue_bias < 0.75:
-        score -= 1.0 * hue_weight
-    elif hue_bias < 0.85:
-        score -= 0.5 * hue_weight
-    elif hue_bias > 1.15:
-        score += 1.0 * hue_weight
-    elif hue_bias > 1.05:
-        score += 0.5 * hue_weight
 
-    if score > 1:
-        return "light"
-    elif score < -1.2:
-        return "deep"
-    return "medium"
-
+# ---------------- ROUTES ---------------- #
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -171,48 +188,33 @@ def health():
 def detect_tone():
     try:
         data = request.get_json(silent=True)
-
         if not data or "image" not in data:
-            return jsonify({"error": "Missing 'image' field"}), 400
+            return jsonify({"error": "Missing image"}), 400
 
-        # Decode base64 to bytes
         img_bytes = base64.b64decode(data["image"])
-
-        # Load with PIL, resize, convert to OpenCV BGR
         img = Image.open(BytesIO(img_bytes)).convert("RGB")
-        img.thumbnail((800, 800))
-        img_rgb = np.array(img)
-        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        img.thumbnail((MAX_IMAGE_SIZE, MAX_IMAGE_SIZE))
 
-        debug_info, chroma, hue_bias, face_img = get_true_skin_tone_from_bgr(img_bgr)
+        img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-        if debug_info is None:
-            return jsonify({
-                "error": "No skin detected",
-                "face_crop": face_img
+        tone, debug, face_crop = analyze_skin_tone(img_bgr)
+
+        if tone is None:
+          return jsonify({
+                "error_code": "NO_FACE_DETECTED",
+                "message": "No face detected. Please upload a clear selfie with your face visible.",
+                "face_crop": face_crop
             }), 400
-
-        y_mean = debug_info["y_mean"]
-        y_p75 = debug_info["y_p75"]
-
-        tone = classify_tone_v2_improved(y_mean, y_p75, chroma, hue_bias)
-
         return jsonify({
             "tone": tone,
-            "debug": {
-                "y_mean": round(y_mean, 2),
-                "y_p75": round(y_p75, 2),
-                "chroma": round(chroma, 2),
-                "hue_bias": round(hue_bias, 2),
-            },
-            "face_crop": face_img,
+            "debug": debug,
+            "face_crop": face_crop
         }), 200
 
-    except Exception:
-        # Avoid leaking internal details in production responses
+    except Exception as e:
+        log.exception("SERVER ERROR")
         return jsonify({"error": "Server error"}), 500
 
 
 if __name__ == "__main__":
-    # For local dev. In production, run via gunicorn/uvicorn.
     app.run(host="0.0.0.0", port=5000, debug=False)
