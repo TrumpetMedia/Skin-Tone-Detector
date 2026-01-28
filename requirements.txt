@@ -4,3 +4,4 @@ gunicorn
 python-dotenv
 Pillow
 openai
+google-genai

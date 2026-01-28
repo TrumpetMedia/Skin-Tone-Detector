@@ -3,7 +3,9 @@ import base64
 import json
 import logging
 from io import BytesIO
-
+from openai import OpenAI
+from google import genai
+from google.genai import types
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
@@ -14,7 +16,7 @@ load_dotenv()
 
 MAX_IMAGE_SIZE = 1024
 MIN_DIM = 180  # if width or height below this, likely unusable selfie
-MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o")
+# MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -22,18 +24,19 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+# client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 SYSTEM_PROMPT = """
-You are a strict skin-tone classifier for cosmetic shade matching.
+Classify facial skin tone for cosmetic shade matching.
 
-Return JSON ONLY in this exact format:
-{"tone":"light"} OR {"tone":"medium"} OR {"tone":"deep"} OR {"tone":null}
+Return ONLY JSON:
+{"tone":"light"} or {"tone":"medium"} or {"tone":"deep"} or {"tone":null}
 
-Rules:
-- If no clear human face is visible, return {"tone":null}
-- If lighting is too dark/bright, heavy shadow, filters, or image is unclear, return {"tone":null}
-- Do not include any extra keys or text.
+If no clear human face is visible or image quality/lighting is bad: {"tone":null}
+No extra keys. No extra text.
 """
 
 VALID_TONES = {"light", "medium", "deep"}
@@ -79,31 +82,56 @@ def detect_tone():
     # ---------- Call OpenAI ----------
     log.info("OPENAI_REQUEST_START | model=%s", MODEL_NAME)
 
+    # try:
+    #     response = client.chat.completions.create(
+    #         model=MODEL_NAME,
+    #         # JSON mode: forces valid JSON output (prevents your parse crash)
+    #         response_format={"type": "json_object"},  # [web:578]
+    #         messages=[
+    #             {"role": "system", "content": SYSTEM_PROMPT},
+    #             {
+    #                 "role": "user",
+    #                 "content": [
+    #                     {"type": "text", "text": "Classify skin tone."},
+    #                     {"type": "image_url", "image_url": {"url": data_url}},
+    #                 ],
+    #             },
+    #         ],
+    #         max_tokens=50,
+    #         temperature=0,
+    #     )
+
     try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            # JSON mode: forces valid JSON output (prevents your parse crash)
-            response_format={"type": "json_object"},  # [web:578]
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Classify skin tone."},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                },
-            ],
-            max_tokens=50,
-            temperature=0,
-        )
+
+     response = client.models.generate_content(
+         model=MODEL_NAME,
+         contents=[
+             types.Part.from_bytes(data=out.getvalue(), mime_type="image/jpeg"),
+             SYSTEM_PROMPT
+         ],
+         config=types.GenerateContentConfig(
+             temperature=0,
+             response_mime_type="application/json",
+             response_json_schema={
+                 "type": "object",
+                 "properties": {
+                     "tone": {"type": ["string", "null"], "enum": ["light", "medium", "deep", None]}
+                 },
+                 "required": ["tone"],
+                 "additionalProperties": False
+             }
+         )
+     )
+
     except Exception as e:
         log.error("OPENAI_CALL_FAILED | %s", str(e))
         return jsonify({"tone": None}), 200
 
     log.info("OPENAI_RESPONSE_RECEIVED")
 
-    raw = (response.choices[0].message.content or "").strip()
+    # raw = (response.choices[0].message.content or "").strip()
+    raw = (response.text or "").strip()
+
     log.info("RAW_MODEL_OUTPUT | %s", raw)
 
     # ---------- Parse JSON safely ----------
