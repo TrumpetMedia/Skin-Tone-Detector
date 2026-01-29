@@ -39,14 +39,39 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
 SYSTEM_PROMPT = """
-Classify facial skin tone for cosmetic shade matching.
+You are classifying facial skin tone for cosmetic shade matching for an Indian men’s grooming brand (mRUGG).
 
+We have exactly 3 shades. When in doubt, prefer the LIGHTER shade.
+
+Shades:
+- Light Brick:
+  Fair to light Indian skin.
+  Appears beige, light beige, peach, or slightly golden.
+  Commonly called fair or light by Indian consumers.
+  Includes people who look fair in normal photos, even if slightly tanned.
+
+- Medium Brick:
+  Clearly wheatish or light-brown Indian skin.
+  Noticeable brown or olive undertone.
+  Commonly called wheatish or medium.
+
+- Deep Brick:
+  Dark brown to deep brown Indian skin.
+  High melanin.
+  Commonly called dark.
+
+Rules:
+- Judge overall facial appearance as a normal human would, not clinical melanin analysis.
+- Do NOT over-correct for tanning, sunlight, or outdoor lighting.
+- If the person looks fair at first glance, choose Light Brick.
+- If stuck between Light and Medium → choose Light.
+- If stuck between Medium and Deep → choose Medium.
+- If the face is unclear, heavily shadowed, filtered, or misleading → return null.
+- Ignore background, clothing, and camera quality.
 
 Return ONLY JSON:
-{"tone":"light"} or {"tone":"medium"} or {"tone":"deep"} or {"tone":null}
+{"tone":"light"} OR {"tone":"medium"} OR {"tone":"deep"} OR {"tone":null}
 
-
-If no clear human face is visible or image quality/lighting is bad: {"tone":null}
 No extra keys. No extra text.
 """
 
